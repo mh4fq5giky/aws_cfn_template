@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create VPC Flow Logs and necessary resources like log groups and IAM roles.
+
+# =======================================
+# Metadata
+# =======================================
+Metadata: 
+  "AWS::CloudFormation::Interface": 
+    ParameterGroups:
+      - Label:
+          default: "Common Configuration"
+        Parameters:
+          - PJPrefix
+          - Environment
+      - Label:
+          default: "VPC Configuration"
+        Parameters:
+          - VPCID
+      - Label:
+          default: "VPC Flow log Configuration"
+        Parameters:
+          - FilterType
+          - LogType
+          - MaxAggregationInterval
+          - RetentionDays          
+
+# =======================================
+# Parameters
+# =======================================
+Parameters:
+  PJPrefix:
+    Type: String
+    Default: testprefix
+    MinLength: 1
+    MaxLength: 12
+    AllowedPattern: "[a-z0-9]+"
+    Description: "Project prefix, consisting of lowercase letters and numbers."
+    ConstraintDescription: "Must contain only lowercase letters and numbers."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [ "dev", "stg", "prd" ]
+    Description: "Deployment environment (dev, stg, or prd)."
+    ConstraintDescription: "Must be one of 'dev', 'stg', or 'prd'."
+
+  VPCID:
+    Type: AWS::EC2::VPC::Id
+    ConstraintDescription: "Select the VPC ID from the available VPCs in your AWS account."
+
+  FilterType:
+    Type: String
+    Default: ALL
+    AllowedValues: [ ALL, ACCEPT, REJECT ] 
+    Description: "Select the type of traffic to capture: ACCEPT, REJECT, or ALL."
+
+  LogType:
+    Type: String
+    Default: cloud-watch-logs
+    AllowedValues: [ cloud-watch-logs, s3 ]
+    Description: "Select the log destination: CloudWatch Logs or an S3 bucket."
+
+  MaxAggregationInterval:
+    Type: Number
+    Default: 600
+    AllowedValues: [ 60, 600 ]
+    Description: "Aggregation interval in seconds (60, 120, 180, 300, or 600)."
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [ 7, 14, 30, 60, 90, 180, 365 ]   
+    Description: "Specify the retention period (in days) for CloudWatch Logs."
+
+# =======================================
+# Conditions
+# =======================================
+Conditions:
+  IsLogs: !Equals [!Ref LogType, cloud-watch-logs]
+  IsS3: !Equals [!Ref LogType, s3]
+
+# =======================================
+# Resources
+# =======================================
+Resources:
+
+  # -------------------------------------
+  # IAM Role for Flowlogs
+  # -------------------------------------
+  # IAM Role for Flowlogs
+  IAMRoleforFlowlogs:
+    Type: AWS::IAM::Role
+    Condition: IsLogs 
+    Properties:
+      RoleName: !Sub ${PJPrefix}-${Environment}-flowlogs-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - vpc-flow-logs.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${PJPrefix}-${Environment}-flowlogs-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-flowlogs-role
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # Logs for Flowlogs
+  LogsforFlowlogs:
+    Type: AWS::Logs::LogGroup
+    Condition: IsLogs
+    Properties:
+      LogGroupName: !Sub ${PJPrefix}-${Environment}-logging
+      RetentionInDays: !Ref RetentionDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-logging
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # VPC FlowLogs CloudWatch
+  VPCFlowLogsCloudWatch:
+    Type: AWS::EC2::FlowLog
+    Condition: IsLogs
+    Properties: 
+      DeliverLogsPermissionArn: !GetAtt IAMRoleforFlowlogs.Arn
+      LogDestinationType: !Ref LogType
+      LogGroupName: !Ref LogsforFlowlogs
+      MaxAggregationInterval: !Ref MaxAggregationInterval
+      ResourceId: !Ref VPCID
+      ResourceType: VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-flowlogs
+        - Key: PJName
+          Value: !Ref PJPrefix
+      TrafficType: !Ref FilterType
+    DependsOn: [ IAMRoleforFlowlogs, LogsforFlowlogs ]
+
+  # -------------------------------------
+  # S3Bucket for Flowlogs
+  # -------------------------------------
+  # S3 Bucket for Flowlogs
+  S3BucketforFlowlogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Condition: IsS3
+    Properties:
+      BucketName: !Sub ${PJPrefix}-${Environment}-s3bucket-flowlogs-${AWS::AccountId}
+      PublicAccessBlockConfiguration: 
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256                  
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub ${PJPrefix}-${Environment}-lifecycle-s3bucket-flowlogs
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true           
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-s3bucket-flowlogs-${AWS::AccountId}
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # VPC FlowLogs S3
+  VPCFlowLogsS3:
+    Type: AWS::EC2::FlowLog
+    Condition: IsS3
+    Properties: 
+      DestinationOptions:
+        FileFormat: plain-text
+        HiveCompatiblePartitions: false
+        PerHourPartition: false 
+      LogDestination: !Sub arn:aws:s3:::${S3BucketforFlowlogs}
+      LogDestinationType: !Ref LogType
+      MaxAggregationInterval: !Ref MaxAggregationInterval
+      ResourceId: !Ref VPCID
+      ResourceType: VPC
+      DeletionPolicy: Retain
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-flowlogs
+        - Key: PJName
+          Value: !Ref PJPrefix
+      TrafficType: !Ref FilterType
+    DependsOn: S3BucketforFlowlogs
+
+# =======================================
+# Outputs
+# =======================================
+Outputs:
+  IAMRoleforFlowlogs:
+    Condition: IsLogs
+    Value: !Ref IAMRoleforFlowlogs
+
+  LogsforFlowlogs:
+    Condition: IsLogs
+    Value: !Ref LogsforFlowlogs  
+
+  VPCFlowLogsCloudWatch:
+    Condition: IsLogs  
+    Value: !Ref VPCFlowLogsCloudWatch  
+
+  VPCFlowLogsS3Bucket:
+    Condition: IsS3
+    Value: !Ref S3BucketforFlowlogs
+
+  VPCFlowLogsS3:
+    Condition: IsS3
+    Value: !Ref VPCFlowLogsS3

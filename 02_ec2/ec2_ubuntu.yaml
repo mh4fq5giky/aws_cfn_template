@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Create an EC2 and connect using SSM
+
+# =======================================
+# Metadata
+# =======================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Common Configuration"
+        Parameters:
+          - PJPrefix
+          - Environment
+          - ServerKind
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - SelectSubnet
+          - AssignElasticIP
+      - Label:
+          default: "EC2 Configuration"
+        Parameters:
+          - AMIId
+          - InstanceType
+          - UserId
+      - Label:
+          default: "EBS Configuration"
+        Parameters:
+          - EBSVolumeType
+          - EBSRootVolumeSize
+      - Label:
+          default: "Connection Method Configuration"
+        Parameters:
+          - UseSSM
+          - UseEIC
+
+# =======================================
+# Parameters
+# =======================================
+Parameters:
+  PJPrefix:
+    Type: String
+    Default: testprefix
+    MinLength: 1
+    MaxLength: 12
+    AllowedPattern: "[a-z0-9]+"
+    Description: "Project prefix, consisting of lowercase letters and numbers."
+    ConstraintDescription: "Must contain only lowercase letters and numbers."
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [ "dev", "stg", "prd" ]
+    Description: "Deployment environment (dev, stg, or prd)."
+
+  ServerKind:
+    Type: String
+    Default: ""
+    ConstraintDescription: "Server kind is required."
+
+  SelectSubnet:
+    Type: String
+    Default: PublicSubnet1
+    AllowedValues: [ "PublicSubnet1", "PublicSubnet2", "PrivateSubnet1", "PrivateSubnet2" ]
+
+  AssignElasticIP:
+    Type: String
+    Default: false
+    AllowedValues: [ "true", "false" ]
+    Description: "Specify whether to assign an Elastic IP (true/false)"
+
+  AMIId:
+    Type: String
+    Default: ami-08f191dd81ec3a3de
+    Description: "Ubuntu 22.04 LTS (x86)"
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: "The EC2 instance type. Choose an instance type that best fits your workload requirements (e.g., t3.micro, t3.medium, etc.)."
+
+  UserId:
+    Type: String
+    Default: sysadmin
+    Description: 'The user ID to be created on the EC2 instance. This will replace the default "ec2-user" account.'
+
+  EBSVolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [ "gp3", "gp2", "io1", "io2" ]
+    Description: "The type of EBS volume to attach to the EC2 instance. Choose from gp3, gp2, io1, or io2."
+    ConstraintDescription: "Must be one of the following: 'gp3', 'gp2', 'io1', or 'io2'."
+
+  EBSRootVolumeSize:
+    Type: Number
+    Default: 20
+    Description: "The size of the root EBS volume in gigabytes (GB). Specify the desired size for the root disk of the EC2 instance."
+
+  UseSSM:
+    Type: String
+    Default: false
+    AllowedValues: [ "true", "false" ]
+    Description: "Whether to use SSM for instance connection."
+
+  UseEIC:
+    Type: String
+    Default: false
+    AllowedValues: [ "true", "false" ]
+    Description: "Whether to use EC2 Instance Connect for instance connection."
+
+# =======================================
+# Condition
+# =======================================
+Conditions:
+  IsPublicSubnet1Selected: !Equals [!Ref SelectSubnet, "PublicSubnet1"]
+  IsPublicSubnet2Selected: !Equals [!Ref SelectSubnet, "PublicSubnet2"]
+  IsPrivateSubnet1Selected: !Equals [!Ref SelectSubnet, "PrivateSubnet1"]
+  IsPrivateSubnet2Selected: !Equals [!Ref SelectSubnet, "PrivateSubnet2"]
+  AssignEIPCondition: !And 
+    - !Equals [!Ref AssignElasticIP, "true"]
+    - !Or [!Condition IsPublicSubnet1Selected, !Condition IsPublicSubnet2Selected]
+  IsUseSSM: !Equals [!Ref UseSSM, "true"]
+  IsUseEIC: !Equals [!Ref UseEIC, "true"]
+
+# =======================================
+# Resources
+# =======================================
+Resources:
+
+  # ---------------------------------------
+  # Key Pair
+  # ---------------------------------------
+  # KeyPair
+  KeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Sub ${PJPrefix}-${Environment}-${ServerKind}-key
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-key
+
+  # -------------------------------------
+  # IAM Role for EC2
+  # -------------------------------------
+  # IAM Role For EC2
+  IAMRoleForEC2:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${PJPrefix}-${Environment}-${ServerKind}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+                - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - !If
+          - IsUseSSM
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          - !Ref AWS::NoValue
+        - !If
+          - IsUseSSM
+          - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+          - !Ref AWS::NoValue
+  # Instance Profile For EC2
+  InstanceProfileForEC2:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${PJPrefix}-${Environment}-${ServerKind}-instance-profile
+      Roles:
+        - !Ref IAMRoleForEC2
+
+  # -------------------------------------
+  # Security Group
+  # -------------------------------------
+  # SecurityGroup For EC2
+  SecurityGroupForEC2:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${PJPrefix}-${Environment}-${ServerKind}-sg
+      GroupDescription: !Sub ${PJPrefix}-${Environment}-${ServerKind}-sg
+      VpcId: { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-vpc"}}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AWS::NoValue
+        - !If
+          - IsUseEIC
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            SourceSecurityGroupId: !Ref EICSecurityGroup
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-ec2-sg
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # -------------------------------------
+  # EC2 Instance Connect Endpoint
+  # -------------------------------------
+  EICSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsUseEIC
+    Properties:
+      GroupDescription: !Sub ${PJPrefix}-${Environment}-${ServerKind}-eic-sg
+      VpcId: { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-vpc"}}
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-eic-sg
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  EICEndpoint:
+    Type: AWS::EC2::InstanceConnectEndpoint
+    Condition: IsUseEIC
+    Properties: 
+      SecurityGroupIds: 
+        - !Ref EICSecurityGroup
+      SubnetId: { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-Public-Subnet1"}}
+
+  # -------------------------------------
+  # Elastic IP
+  # -------------------------------------
+  # ElasticIP For EC2
+  EIPForEC2:
+    Type: AWS::EC2::EIP
+    Condition: AssignEIPCondition
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-eip
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # ElasticIP Association For EC2
+  EIPAssociationForEC2:
+    Type: AWS::EC2::EIPAssociation
+    Condition: AssignEIPCondition
+    Properties:
+      AllocationId: !GetAtt EIPForEC2.AllocationId
+      InstanceId: !Ref EC2Instance
+
+  # -------------------------------------
+  # ENI for EC2
+  # -------------------------------------
+  # ENI For EC2
+  ENIForEC2:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: !Sub ${PJPrefix}-${Environment}-${ServerKind}
+      SourceDestCheck: false
+      GroupSet: 
+        - !Ref SecurityGroupForEC2
+      SubnetId: !If
+        - IsPrivateSubnet1Selected
+        - { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-Private-Subnet1"}}
+        - !If
+          - IsPrivateSubnet2Selected
+          - { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-Private-Subnet2"}}
+          - !If
+            - IsPublicSubnet1Selected
+            - { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-Public-Subnet1"}}
+            - { "Fn::ImportValue": { "Fn::Sub": "${PJPrefix}-${Environment}-Public-Subnet2"}}
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-eni
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+  # -------------------------------------
+  # EC2
+  # -------------------------------------
+  # EC2 Instance
+  EC2Instance: 
+    Type: AWS::EC2::Instance
+    Properties: 
+      ImageId: !Ref AMIId
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: !Ref EBSVolumeType
+            VolumeSize: !Ref EBSRootVolumeSize
+            DeleteOnTermination: true
+      IamInstanceProfile: !Ref InstanceProfileForEC2
+      InstanceInitiatedShutdownBehavior: stop
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref ENIForEC2
+          DeviceIndex: 0
+      KeyName: !Ref KeyPair
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+
+              # needrestart setting
+              echo "\$nrconf{restart} = 'a';" | sudo tee /etc/needrestart/conf.d/50local.conf
+
+              # Create a new user account
+              useradd ${UserId}
+              cat /etc/passwd | grep ${UserId}
+
+              # Grant administrative privileges to the user account (sudo group in Ubuntu)
+              echo "${UserId} ALL=(ALL) NOPASSWD:ALL" | tee --append /etc/sudoers.d/90-cloud-init-users
+
+              # Grant sudo privileges (sudo group for Ubuntu)
+              usermod -aG sudo ${UserId}
+              cat /etc/group | grep sudo
+
+              # Copy the public key from ubuntu user and adjust permissions (reuse the key)
+              cp -R /home/ubuntu/.ssh /home/${UserId}
+              chown -R ${UserId}:${UserId} /home/${UserId}/.ssh
+              chmod -R 600 /home/${UserId}/.ssh
+              chmod 700 /home/${UserId}/.ssh
+              ls -la /home/${UserId}/.ssh
+
+              # Disable/Delete the ubuntu user account (if needed)
+              echo "DenyUsers ubuntu" | tee --append /etc/ssh/sshd_config
+              userdel -r ubuntu
+              systemctl restart sshd
+
+              # package update
+              sudo apt-get update && sudo apt-get upgrade -y
+
+              # locale settings
+              sudo apt-get install -y language-pack-ja-base language-pack-ja
+              sudo localectl set-locale LANG=ja_JP.UTF-8
+              sudo timedatectl set-timezone Asia/Tokyo
+
+            - {
+              UserId: !Ref UserId
+            }
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${PJPrefix}-${Environment}-${ServerKind}-ec2
+        - Key: PJName
+          Value: !Ref PJPrefix
+
+# =======================================
+# Outputs
+# =======================================
+Outputs:
+  EC2InstanceId:
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub ${PJPrefix}-${Environment}-${ServerKind}-EC2InstanceId
+
+  EC2PublicIP:
+    Value: !If
+      - AssignEIPCondition
+      - !Ref EIPForEC2
+      - "N/A"
+    Export:
+      Name: !Sub ${PJPrefix}-${Environment}-${ServerKind}-EC2PublicIP
+
+  SecurityGroupId:
+    Value: !Ref SecurityGroupForEC2
+    Export:
+      Name: !Sub ${PJPrefix}-${Environment}-${ServerKind}-SecurityGroupId
+
+  KeyPairName:
+    Value: !Ref KeyPair
+    Export:
+      Name: !Sub ${PJPrefix}-${Environment}-${ServerKind}-KeyPairName
